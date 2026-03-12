@@ -133,7 +133,7 @@ The project uses `setuptools` and `pyproject.toml`.
 ```bash
 # Create a virtual environment
 python -m venv .venv
-source .venv/bin/bin/activate
+source .venv/bin/activate
 pip install --upgrade pip
 
 # install build tool
