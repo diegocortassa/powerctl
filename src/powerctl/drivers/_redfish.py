@@ -164,8 +164,32 @@ class RedfishMixin:
                 raise AuthenticationError(
                     f"Authentication failed for {self._host.hostname}: HTTP {exc.code}"
                 ) from exc
+
+            # Try to extract error detail from response body
+            detail = ""
+            try:
+                raw = exc.read()
+                if raw:
+                    error_body = json.loads(raw)
+                    # Redfish extended error format
+                    messages = error_body.get("error", {}).get(
+                        "@Message.ExtendedInfo", []
+                    ) or error_body.get("Messages", [])
+                    if messages:
+                        ids = ", ".join(
+                            m.get("MessageID", "")
+                            for m in messages
+                            if m.get("MessageID")
+                        )
+                        args = messages[0].get("MessageArgs", [])
+                        detail = f" [{ids}]"
+                        if args:
+                            detail += f": {', '.join(str(a) for a in args)}"
+            except Exception:
+                pass
+
             raise CommandError(
-                f"HTTP {exc.code} from {url}: {exc.reason}", exit_code=exc.code
+                f"HTTP {exc.code} from {url}: {exc.reason}{detail}", exit_code=exc.code
             ) from exc
         except URLError as exc:
             raise ConnectionError(
