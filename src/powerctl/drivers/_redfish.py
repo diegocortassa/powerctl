@@ -35,6 +35,19 @@ _REDFISH_POWER_STATE_MAP: dict[str, PowerStatus] = {
 }
 
 
+# Preferred reset type, in order of preference, for each logical action.
+# The first value that appears in the firmware's AllowableValues list wins.
+_RESET_TYPE_FALLBACKS: dict[str, list[str]] = {
+    "power_on": ["On"],
+    "power_off": ["ForceOff", "Off"],
+    "power_cycle": ["ForceRestart", "PowerCycle"],
+    "reboot": ["GracefulRestart", "ForceRestart"],
+    # iLO 4 / iLO 5 < 1.40 don't have GracefulShutdown — fall back to
+    # PushPowerButton which triggers the OS shutdown via ACPI.
+    "shutdown": ["GracefulShutdown", "PushPowerButton"],
+}
+
+
 class HTTPRedirectHandler308(HTTPRedirectHandler):
     """Custom redirect handler that properly follows HTTP 308 (Permanent Redirect).
 
@@ -48,11 +61,11 @@ class HTTPRedirectHandler308(HTTPRedirectHandler):
         """Handle HTTP 308 Permanent Redirect."""
         if "location" in headers:
             newurl = urljoin(req.full_url, headers["location"])
-            newheaders = dict(
-                (k, v)
+            newheaders = {
+                k: v
                 for k, v in req.headers.items()
                 if k.lower() not in ("content-length", "host")
-            )
+            }
             new_req = Request(
                 newurl,
                 data=req.data,
@@ -84,16 +97,11 @@ class RedfishMixin:
     _POWER_URI: str = "/redfish/v1/Systems/1"
     _RESET_URI: str = "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
 
-    # Redfish reset-type values (Redfish standard names)
-    _RESET_TYPE_MAP: dict[str, str] = {
-        "power_on": "On",
-        "power_off": "ForceOff",
-        "power_cycle": "ForceRestart",
-        "reboot": "GracefulRestart",
-        "shutdown": "GracefulShutdown",
-    }
+    _host: Host
 
-    _host: Host  # provided by the concrete driver class
+    # Cache of resolved action -> reset type string, populated on first use.
+    # Stored per-instance so each host gets its own capability snapshot.
+    _resolved_reset_types: dict[str, str] | None = None
 
     # ------------------------------------------------------------------
     # Pure helpers (no I/O - safe to call from any context)
@@ -121,12 +129,6 @@ class RedfishMixin:
             "Authorization": f"Basic {token}",
             "Accept": "application/json",
         }
-
-    def _headers(self) -> dict[str, str]:
-        """Build headers including Content-Type for requests with a body."""
-        headers = self._base_headers()
-        headers["Content-Type"] = "application/json"
-        return headers
 
     # ------------------------------------------------------------------
     # Blocking I/O - NEVER call directly from async code
@@ -196,9 +198,58 @@ class RedfishMixin:
                 f"Cannot reach {self._host.hostname}: {exc.reason}"
             ) from exc
 
+    def _sync_fetch_allowable_reset_types(self) -> set[str]:
+        """Query the system resource and extract AllowableValues for Reset.
+
+        Falls back to an empty set if the firmware doesn't advertise them,
+        in which case the caller will use the first (preferred) value blindly.
+        """
+        try:
+            data = self._sync_request("GET", self._POWER_URI)
+        except (CommandError, ConnectionError):
+            return set()
+
+        # Standard Redfish location:
+        # Actions -> #ComputerSystem.Reset -> ResetType@Redfish.AllowableValues
+        actions = data.get("Actions", {})
+        reset_action = actions.get("#ComputerSystem.Reset", {})
+        allowable: list[str] = reset_action.get("ResetType@Redfish.AllowableValues", [])
+
+        # Some older firmware puts them one level up or uses a different key
+        if not allowable:
+            allowable = reset_action.get("AllowableValues", [])
+
+        return set(allowable)
+
+    def _sync_build_reset_map(self) -> dict[str, str]:
+        """Resolve each logical action to the best supported reset type."""
+        allowable = self._sync_fetch_allowable_reset_types()
+        resolved: dict[str, str] = {}
+
+        for action, candidates in _RESET_TYPE_FALLBACKS.items():
+            if allowable:
+                # Pick the first candidate the firmware actually advertises
+                chosen = next((c for c in candidates if c in allowable), None)
+                if chosen is None:
+                    # Nothing matched — use the first candidate and let the
+                    # firmware reject it with a clear error message
+                    chosen = candidates[0]
+            else:
+                # Firmware didn't advertise anything; trust our preference order
+                chosen = candidates[0]
+            resolved[action] = chosen
+
+        return resolved
+
+    def _sync_resolve_reset_type(self, action: str) -> str:
+        """Return the resolved reset type for *action*, building the cache if needed."""
+        if self._resolved_reset_types is None:
+            self._resolved_reset_types = self._sync_build_reset_map()
+        return self._resolved_reset_types[action]
+
     def _sync_reset(self, action: str) -> dict[str, Any]:
         """Send a Redfish reset action. Must run in a thread pool."""
-        reset_type = self._RESET_TYPE_MAP[action]
+        reset_type = self._sync_resolve_reset_type(action)
         return self._sync_request("POST", self._RESET_URI, {"ResetType": reset_type})
 
     def _sync_query_status(self) -> StatusResult:
@@ -224,3 +275,7 @@ class RedfishMixin:
     async def _query_status(self) -> StatusResult:
         """Async wrapper: offloads the blocking Redfish GET to a thread."""
         return await asyncio.to_thread(self._sync_query_status)
+
+    async def _prefetch_capabilities(self) -> None:
+        """Eagerly populate the reset-type cache. Optional but useful on connect."""
+        await asyncio.to_thread(self._sync_build_reset_map)
